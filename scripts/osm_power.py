@@ -9,9 +9,17 @@ Optimized for GitHub Actions free tier.
 Features:
 - Multi-endpoint retry with failover
 - Quadtree spatial tiling for large queries that timeout
-- Automatic retry with bbox subdivision on connection failures
+- Pre-emptive tiling for known-large tags (skips wasteful global attempts)
+- Shorter timeouts for faster failover
 - Deduplication of elements crossing tile boundaries
 - Memory-efficient processing
+
+Changes from v1:
+- Removed osm.jp endpoint (always 403)
+- Added PRE_TILE_TAGS to skip global query for line/minor_line/substation
+- Reduced WAY_TIMEOUT from 3600s to 240s (below Azure NAT ~280s limit)
+- Added elapsed time tracking for diagnostics
+- Endpoints: private.coffee (quality) → mail.ru (reliable) → overpass-api.de (fast-fail)
 """
 
 import os
@@ -49,14 +57,34 @@ WAY_POWER_TAGS = [
     "substation",
 ]
 
+# Tags that are known to timeout on global queries - skip straight to tiling
+# Based on empirical testing: these always fail globally and waste ~10 min each
+PRE_TILE_TAGS = {"line", "minor_line", "substation"}
+
+# Endpoint order: quality first, reliable fallback, fast-fail last
+# Removed osm.jp - always returns 403
 OVERPASS_ENDPOINTS = [
-    "https://overpass.private.coffee/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
-    "http://overpass-api.de/api/interpreter",
-    "https://overpass.osm.jp/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",  # Best data quality
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",  # Most reliable for large queries
+    "https://overpass-api.de/api/interpreter",  # Fast 504 on overload (good for quick failover)
 ]
 
-TIMEOUT = 3600  # seconds
+# Timeouts: (connect_timeout, read_timeout)
+#
+# CRITICAL: GitHub Actions runs on Azure infrastructure with ~280s idle connection timeout.
+# Overpass processes queries entirely server-side before sending ANY response data,
+# meaning the connection sits idle during processing. If processing exceeds ~280s,
+# Azure NAT kills the connection with "RemoteDisconnected" before we receive data.
+#
+# Strategy:
+# - Set timeout to 240s (below 280s NAT limit, but allows legitimate queries time)
+# - Queries completing in <240s succeed
+# - Queries that would take >280s fail faster and trigger tiling sooner
+# - The 40s buffer (240→280) accounts for network variance
+#
+# From home IPs this limit doesn't exist, but we optimize for GHA where it matters.
+NODE_TIMEOUT = (30, 300)   # 5 min read for smaller node queries (rarely hit limits)
+WAY_TIMEOUT = (30, 240)    # 4 min read for way queries (below Azure NAT ~280s limit)
 
 # Quadtree tiling config
 WORLD_BBOX = (-90, -180, 90, 180)  # (south, west, north, east)
@@ -127,15 +155,15 @@ def deduplicate_elements(elements: list[dict], verbose: bool = False) -> list[di
 # === QUERY BUILDERS =======================================================
 
 
-def build_node_query(tag: str) -> str:
+def build_node_query(tag: str, timeout: int = 300) -> str:
     """Build Overpass QL query for node elements."""
-    return f'[out:json][timeout:{TIMEOUT}];node["power"="{tag}"];out meta;'
+    return f'[out:json][timeout:{timeout}];node["power"="{tag}"];out meta;'
 
 
-def build_way_query(tag: str, bbox: tuple[float, float, float, float] | None = None) -> str:
+def build_way_query(tag: str, bbox: tuple[float, float, float, float] | None = None, timeout: int = 180) -> str:
     """Build Overpass QL query for way elements."""
     bbox_str = f"({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]})" if bbox else ""
-    return f'[out:json][timeout:{TIMEOUT}];way["power"="{tag}"]{bbox_str};out geom;'
+    return f'[out:json][timeout:{timeout}];way["power"="{tag}"]{bbox_str};out geom;'
 
 
 # === FETCH LOGIC ==========================================================
@@ -144,6 +172,7 @@ def build_way_query(tag: str, bbox: tuple[float, float, float, float] | None = N
 def fetch_single_endpoint(
     query: str,
     endpoint: str,
+    timeout: tuple[int, int],
 ) -> tuple[list[dict] | None, str | None, bool]:
     """
     Fetch from a single endpoint.
@@ -153,45 +182,52 @@ def fetch_single_endpoint(
     - error_message: error description if failed
     - is_retriable: True if failure should trigger tiling
     """
+    import time
+    start_time = time.time()
+
     try:
         response = requests.post(
             endpoint,
             data={"data": query},
-            timeout=(30, TIMEOUT),
+            timeout=timeout,
         )
+        elapsed = time.time() - start_time
 
         # HTTP error codes
         if response.status_code == 429:
-            return None, "HTTP 429 (rate limited)", True
+            return None, f"HTTP 429 (rate limited) [{elapsed:.1f}s]", True
 
         if response.status_code >= 500:
-            return None, f"HTTP {response.status_code} (server error)", True
+            return None, f"HTTP {response.status_code} (server error) [{elapsed:.1f}s]", True
 
         if response.status_code != 200:
-            return None, f"HTTP {response.status_code}", False
+            return None, f"HTTP {response.status_code} [{elapsed:.1f}s]", False
 
         # Parse JSON
         try:
             data = response.json()
         except json.JSONDecodeError as e:
             # Empty response typically means server timeout/overload
-            return None, f"JSON decode error: {e}", True
+            return None, f"JSON decode error [{elapsed:.1f}s]: {e}", True
 
         elements = data.get("elements", [])
-        return elements, None, False
+        return elements, f"[{elapsed:.1f}s]", False  # Include timing in "error" field for logging
 
     except requests.exceptions.Timeout as e:
-        return None, f"Timeout: {e}", True
+        elapsed = time.time() - start_time
+        return None, f"Timeout [{elapsed:.1f}s]: {e}", True
 
     except requests.exceptions.ConnectionError as e:
+        elapsed = time.time() - start_time
         error_str = str(e)
-        return None, f"Connection error: {e}", is_retriable_error(error_str)
+        return None, f"Connection error [{elapsed:.1f}s]: {e}", is_retriable_error(error_str)
 
     except requests.exceptions.RequestException as e:
-        return None, f"Request error: {e}", False
+        elapsed = time.time() - start_time
+        return None, f"Request error [{elapsed:.1f}s]: {e}", False
 
 
-def fetch_with_retry(query: str, label: str) -> tuple[list[dict] | None, bool]:
+def fetch_with_retry(query: str, label: str, timeout: tuple[int, int]) -> tuple[list[dict] | None, bool]:
     """
     Try all endpoints in sequence.
 
@@ -204,16 +240,16 @@ def fetch_with_retry(query: str, label: str) -> tuple[list[dict] | None, bool]:
     for endpoint in OVERPASS_ENDPOINTS:
         log(f"    🔗 Trying {endpoint}...")
 
-        elements, error, is_retriable = fetch_single_endpoint(query, endpoint)
+        elements, error_or_timing, is_retriable = fetch_single_endpoint(query, endpoint, timeout)
 
         if elements is not None:
-            # Success - note that 0 elements is valid for regional tiles
-            log(f"      ✅ {len(elements):,} elements")
+            # Success - error_or_timing contains timing info on success
+            log(f"      ✅ {len(elements):,} elements {error_or_timing}")
             return elements, False
 
         # Log the error
         symbol = "⚡" if is_retriable else "❌"
-        log(f"      {symbol} {error}")
+        log(f"      {symbol} {error_or_timing}")
 
         if is_retriable:
             any_retriable = True
@@ -227,8 +263,8 @@ def fetch_with_retry(query: str, label: str) -> tuple[list[dict] | None, bool]:
 
 def fetch_nodes(tag: str) -> list[dict] | None:
     """Fetch node data with multi-endpoint retry."""
-    query = build_node_query(tag)
-    elements, _ = fetch_with_retry(query, f"node:{tag}")
+    query = build_node_query(tag, timeout=NODE_TIMEOUT[1])
+    elements, _ = fetch_with_retry(query, f"node:{tag}", NODE_TIMEOUT)
     return elements
 
 
@@ -248,27 +284,38 @@ def fetch_ways_with_tiling(
     - Recursively fetch each quadrant
     - Merge and deduplicate results
 
+    For PRE_TILE_TAGS: Skip global query entirely to save time.
+
     Returns: list of OSM elements, or None if unrecoverable failure
     """
     indent = "  " * depth
     label = f"way:{tag}"
 
-    # Log what we're fetching
-    if depth == 0:
-        # Global query (no bbox)
-        query = build_way_query(tag, None)
-    else:
-        log(f"{indent}📦 Tile depth={depth} bbox={bbox_to_str(bbox)}")
-        query = build_way_query(tag, bbox)
+    # Check if we should skip global query (pre-emptive tiling)
+    should_skip_global = (depth == 0) and (tag in PRE_TILE_TAGS)
 
-    # Try all endpoints
-    elements, should_tile = fetch_with_retry(query, label)
+    if should_skip_global:
+        log(f"{indent}⏭️ PRE-EMPTIVE TILING: Skipping global query for '{tag}' (known to timeout)")
+        log(f"{indent}  🔀 Splitting into 4 quadrants (depth 0 → 1)...")
+        should_tile = True
+        elements = None
+    else:
+        # Normal fetch attempt
+        if depth == 0:
+            # Global query (no bbox)
+            query = build_way_query(tag, None, timeout=WAY_TIMEOUT[1])
+        else:
+            log(f"{indent}📦 Tile depth={depth} bbox={bbox_to_str(bbox)}")
+            query = build_way_query(tag, bbox, timeout=WAY_TIMEOUT[1])
+
+        # Try all endpoints
+        elements, should_tile = fetch_with_retry(query, label, WAY_TIMEOUT)
 
     if elements is not None:
         return elements
 
     # Check if we should attempt tiling
-    if not should_tile:
+    if not should_tile and not should_skip_global:
         log(f"{indent}  ❌ Non-retriable failure, cannot tile")
         return None
 
@@ -277,7 +324,9 @@ def fetch_ways_with_tiling(
         return None
 
     # Quadtree subdivision
-    log(f"{indent}  🔀 Splitting into 4 quadrants (depth {depth} → {depth + 1})...")
+    if not should_skip_global:
+        log(f"{indent}  🔀 Splitting into 4 quadrants (depth {depth} → {depth + 1})...")
+
     quadrants = split_bbox(bbox)
     quad_names = ["SW", "SE", "NW", "NE"]
     all_elements = []
@@ -449,14 +498,23 @@ def process_way_tag(tag: str) -> bool:
 
 
 def main() -> None:
+    import time
+    total_start = time.time()
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     total_tags = len(NODE_POWER_TAGS) + len(WAY_POWER_TAGS)
     log("Starting OSM Power Infrastructure Pipeline")
     log(f"Node tags: {NODE_POWER_TAGS}")
     log(f"Way tags: {WAY_POWER_TAGS}")
+    log(f"Pre-tile tags (skip global): {PRE_TILE_TAGS}")
     log(f"Total: {total_tags} tags to process")
-    log(f"Max tile depth: {MAX_TILE_DEPTH}\n")
+    log(f"Max tile depth: {MAX_TILE_DEPTH}")
+    log(f"Node timeout: {NODE_TIMEOUT[1]}s | Way timeout: {WAY_TIMEOUT[1]}s")
+    log(f"Endpoints ({len(OVERPASS_ENDPOINTS)}):")
+    for ep in OVERPASS_ENDPOINTS:
+        log(f"  - {ep}")
+    log("")
 
     results = {"success": [], "failed": []}
 
@@ -483,6 +541,7 @@ def main() -> None:
             results["failed"].append(f"way:{tag}")
 
     # Summary
+    total_elapsed = time.time() - total_start
     log("=" * 60)
     log("SUMMARY")
     log("=" * 60)
@@ -491,6 +550,7 @@ def main() -> None:
         log(f"❌ Failed: {results['failed']}")
     else:
         log("🎉 All tags processed successfully!")
+    log(f"⏱️ Total elapsed: {total_elapsed/60:.1f} minutes ({total_elapsed/3600:.2f} hours)")
 
 
 if __name__ == "__main__":
