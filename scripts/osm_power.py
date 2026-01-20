@@ -10,14 +10,19 @@ Features:
 - Multi-endpoint retry with failover
 - Quadtree spatial tiling for large queries that timeout
 - Pre-emptive tiling for known-large tags (skips wasteful global attempts)
-- Shorter timeouts for faster failover
+- Tag-specific max tile depth for extra-dense datasets
+- Timeout tuned for Azure NAT ~283s limit
 - Deduplication of elements crossing tile boundaries
 - Memory-efficient processing
 
-Changes from v1:
+Changes v3 (from v2):
+- Increased WAY_TIMEOUT from 240s to 270s (just below Azure NAT ~283s limit)
+- Added TAG_MAX_DEPTH for minor_line (depth 4) to handle Western Europe density
+- Added 'cable' to PRE_TILE_TAGS
+
+Changes v2 (from v1):
 - Removed osm.jp endpoint (always 403)
 - Added PRE_TILE_TAGS to skip global query for line/minor_line/substation
-- Reduced WAY_TIMEOUT from 3600s to 240s (below Azure NAT ~280s limit)
 - Added elapsed time tracking for diagnostics
 - Endpoints: private.coffee (quality) → mail.ru (reliable) → overpass-api.de (fast-fail)
 """
@@ -59,7 +64,14 @@ WAY_POWER_TAGS = [
 
 # Tags that are known to timeout on global queries - skip straight to tiling
 # Based on empirical testing: these always fail globally and waste ~10 min each
-PRE_TILE_TAGS = {"line", "minor_line", "substation"}
+PRE_TILE_TAGS = {"line", "minor_line", "substation", "cable"}
+
+# Tag-specific max tile depth (overrides MAX_TILE_DEPTH for specific tags)
+# minor_line is the densest dataset - Western Europe alone has 500K+ elements
+# and requires depth 4 to subdivide into manageable chunks
+TAG_MAX_DEPTH = {
+    "minor_line": 4,  # 1→4→16→64→256 tiles max
+}
 
 # Endpoint order: quality first, reliable fallback, fast-fail last
 # Removed osm.jp - always returns 403
@@ -71,20 +83,24 @@ OVERPASS_ENDPOINTS = [
 
 # Timeouts: (connect_timeout, read_timeout)
 #
-# CRITICAL: GitHub Actions runs on Azure infrastructure with ~280s idle connection timeout.
+# CRITICAL: GitHub Actions runs on Azure infrastructure with ~283s idle connection timeout.
 # Overpass processes queries entirely server-side before sending ANY response data,
-# meaning the connection sits idle during processing. If processing exceeds ~280s,
+# meaning the connection sits idle during processing. If processing exceeds ~283s,
 # Azure NAT kills the connection with "RemoteDisconnected" before we receive data.
 #
+# Empirical measurements from GHA logs:
+#   - Connection error [283.8s]: RemoteDisconnected
+#   - Connection error [282.8s]: RemoteDisconnected
+#
 # Strategy:
-# - Set timeout to 240s (below 280s NAT limit, but allows legitimate queries time)
-# - Queries completing in <240s succeed
-# - Queries that would take >280s fail faster and trigger tiling sooner
-# - The 40s buffer (240→280) accounts for network variance
+# - Set timeout to 270s (just below 283s NAT limit, maximizes success window)
+# - Queries completing in <270s succeed
+# - Queries that would take >283s fail only ~13s faster than Azure would kill them anyway
+# - The 13s buffer accounts for network variance
 #
 # From home IPs this limit doesn't exist, but we optimize for GHA where it matters.
 NODE_TIMEOUT = (30, 300)   # 5 min read for smaller node queries (rarely hit limits)
-WAY_TIMEOUT = (30, 240)    # 4 min read for way queries (below Azure NAT ~280s limit)
+WAY_TIMEOUT = (30, 270)    # 4.5 min read for way queries (just below Azure NAT ~283s limit)
 
 # Quadtree tiling config
 WORLD_BBOX = (-90, -180, 90, 180)  # (south, west, north, east)
@@ -319,8 +335,10 @@ def fetch_ways_with_tiling(
         log(f"{indent}  ❌ Non-retriable failure, cannot tile")
         return None
 
-    if depth >= MAX_TILE_DEPTH:
-        log(f"{indent}  ❌ Max tile depth ({MAX_TILE_DEPTH}) reached")
+    # Get tag-specific max depth, or fall back to global MAX_TILE_DEPTH
+    max_depth = TAG_MAX_DEPTH.get(tag, MAX_TILE_DEPTH)
+    if depth >= max_depth:
+        log(f"{indent}  ❌ Max tile depth ({max_depth}) reached for '{tag}'")
         return None
 
     # Quadtree subdivision
@@ -509,7 +527,7 @@ def main() -> None:
     log(f"Way tags: {WAY_POWER_TAGS}")
     log(f"Pre-tile tags (skip global): {PRE_TILE_TAGS}")
     log(f"Total: {total_tags} tags to process")
-    log(f"Max tile depth: {MAX_TILE_DEPTH}")
+    log(f"Max tile depth: {MAX_TILE_DEPTH} (default), tag-specific: {TAG_MAX_DEPTH}")
     log(f"Node timeout: {NODE_TIMEOUT[1]}s | Way timeout: {WAY_TIMEOUT[1]}s")
     log(f"Endpoints ({len(OVERPASS_ENDPOINTS)}):")
     for ep in OVERPASS_ENDPOINTS:
